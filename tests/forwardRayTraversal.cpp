@@ -7,6 +7,7 @@
 #include <catch2/catch_template_test_macros.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <data/TraceData.hpp>
+#include <kernels/forward/policyRay.hpp>
 #include <kernels/forward/rayTransition.hpp>
 
 #include <algorithm>
@@ -86,6 +87,22 @@ namespace hase::tests
         return mesh;
     }
 
+    hase::data::TraceView traversalView(hase::data::TraceData const& mesh)
+    {
+        hase::data::TraceView view{};
+        view.points = mesh.points;
+        view.cellPointIndices = mesh.cellPointIndices;
+        view.cellFaces = mesh.cellFaces;
+        view.barycentricFacePlanes = mesh.barycentricFacePlanes;
+        view.cellNeighborCells = mesh.cellNeighborCells;
+        view.cellNeighborLocalFaces = mesh.cellNeighborLocalFaces;
+        view.numberOfCells = mesh.numberOfCells;
+        view.numberOfFacesPerCell = mesh.numberOfFacesPerCell;
+        view.numberOfCellVertices = mesh.numberOfCellVertices;
+        view.numberOfMeshPoints = mesh.numberOfMeshPoints;
+        return view;
+    }
+
     struct TraversalResult
     {
         hase::kernels::forward::Tet4FaceIntersection intersection;
@@ -155,6 +172,125 @@ namespace hase::tests
                 result.toDeviceView()});
         result.toHost(queue);
         return result.getHostView()[0u];
+    }
+
+    /** Minimal single-cell walk that keeps resuming after an exterior boundary hit. */
+    struct AlwaysContinueBoundary : hase::kernels::forward::ray::behaviourDimension::Boundary
+    {
+        ALPAKA_FN_ACC hase::kernels::forward::ray::BoundaryResult operator()(
+            alpaka::onAcc::concepts::Acc auto const&,
+            hase::data::TraceView const&,
+            hase::kernels::forward::ray::State auto&,
+            unsigned,
+            unsigned) const
+        {
+            return hase::kernels::forward::ray::BoundaryResult::continueTraversal;
+        }
+    };
+
+    /** Minimal cell policy that keeps traversing without depositing a contribution. */
+    struct ContinueAtCell : hase::kernels::forward::ray::behaviourDimension::Cell
+    {
+        ALPAKA_FN_ACC bool operator()(
+            alpaka::onAcc::concepts::Acc auto const&,
+            hase::data::TraceView const&,
+            hase::kernels::forward::ray::State auto&,
+            unsigned,
+            hase::kernels::forward::Tet4FaceIntersection) const
+        {
+            return true;
+        }
+    };
+
+    /** Reuses the generic walker's failure hook to record that the guard terminated the walk. */
+    template<typename T_FailureView>
+    struct RecordNonProgressFailure : hase::kernels::forward::ray::behaviourDimension::Failure
+    {
+        T_FailureView failures;
+
+        ALPAKA_FN_HOST_ACC constexpr explicit RecordNonProgressFailure(T_FailureView value) : failures{value}
+        {
+        }
+
+        ALPAKA_FN_ACC void operator()(
+            alpaka::onAcc::concepts::Acc auto const& acc,
+            hase::data::TraceView const&,
+            hase::kernels::forward::ray::State auto&)
+        {
+            alpaka::onAcc::atomicAdd(acc, &failures[0u], 1u);
+        }
+    };
+
+    struct WalkOneRay
+    {
+        template<typename TAcc, alpaka::concepts::IMdSpan TIntFailure>
+        ALPAKA_FN_ACC void operator()(
+            TAcc const& acc,
+            hase::data::TraceView const mesh,
+            unsigned const startCell,
+            hase::core::Point const origin,
+            hase::core::Point const direction,
+            TIntFailure failure,
+            bool const continueAtBoundary) const
+        {
+            namespace ray = hase::kernels::forward::ray;
+            ray::TraversalState rayState;
+            rayState.position = origin;
+            rayState.direction = direction;
+            rayState.cell = startCell;
+            rayState.forbiddenFace = -1;
+            if(continueAtBoundary)
+            {
+                ray::walk(
+                    acc,
+                    mesh,
+                    rayState,
+                    ray::RayWalkBehaviour{
+                        ContinueAtCell{},
+                        AlwaysContinueBoundary{},
+                        RecordNonProgressFailure<TIntFailure>{failure}});
+            }
+            else
+            {
+                ray::walk(
+                    acc,
+                    mesh,
+                    rayState,
+                    ray::RayWalkBehaviour{
+                        ContinueAtCell{},
+                        ray::BoundaryPolicyEscape{},
+                        RecordNonProgressFailure<TIntFailure>{failure}});
+            }
+        }
+    };
+
+    std::uint32_t walkRay(
+        auto& device,
+        auto const executor,
+        hase::data::TraceData& hostMesh,
+        unsigned const startCell,
+        hase::core::Point const origin,
+        hase::core::Point const direction,
+        bool const continueAtBoundary)
+    {
+        auto queue = device.makeQueue(alpaka::queueKind::blocking);
+        auto deviceMesh = hostMesh.makeResident(device);
+        deviceMesh.toDevice(queue);
+        auto failure = hase::alpakaUtils::getHybridBuffer(device, std::vector<std::uint32_t>(1u, 0u));
+        failure.toDevice(queue);
+        auto const frameSpec = hase::alpakaUtils::getFrameSpec<std::uint32_t>(device, executor, alpaka::Vec{1u});
+        queue.enqueue(
+            frameSpec,
+            alpaka::KernelBundle{
+                WalkOneRay{},
+                deviceMesh.view(),
+                startCell,
+                origin,
+                direction,
+                failure.toDeviceView(),
+                continueAtBoundary});
+        failure.toHost(queue);
+        return failure.getHostView()[0u];
     }
 
 } // namespace hase::tests
@@ -257,4 +393,58 @@ TEMPLATE_LIST_TEST_CASE(
     CHECK(result.transition.forbiddenFace == 0);
     CHECK(result.nextIntersection.localFace >= 0);
     CHECK(result.nextIntersection.length == Catch::Approx(0.6));
+}
+
+TEMPLATE_LIST_TEST_CASE(
+    "forward ray on an exterior face reports failure instead of spinning",
+    "[forward][traversal][edge-case]",
+    hase::tests::TestBackends)
+{
+    auto const backend = TestType::makeDict();
+    auto deviceSelector = alpaka::onHost::makeDeviceSelector(backend);
+    if(!deviceSelector.isAvailable())
+    {
+        SUCCEED("No device available for " << alpaka::onHost::DeviceSpec{backend}.getName());
+        return;
+    }
+    auto device = deviceSelector.makeDevice(0);
+
+    // Single tetrahedron. Face 0 spans vertices {1,2,3}, which lie in the plane x = 0,
+    // and is the exterior tet4BoundaryFace. The opposite vertex 0 sits at x = 0.5, so the
+    // outward direction for face 0 is -x.
+    std::vector<hase::core::Point> const points{{0.5, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}, {0.0, 0.0, -1.0}};
+    auto mesh = hase::tests::makeTraversalMesh(points, {{0u, 1u, 2u, 3u}});
+
+    hase::core::Point const direction{-1.0, 0.0, 0.0};
+    auto const hostView = hase::tests::traversalView(mesh);
+
+    // A normal onward ray advances and terminates at the escaping exterior boundary without
+    // tripping the non-progress guard.
+    hase::core::Point const interiorOrigin{0.125, 0.25, 0.0};
+    auto const escaped = hase::tests::walkRay(
+        device,
+        alpaka::getExecutor(backend),
+        mesh,
+        0u,
+        interiorOrigin,
+        direction,
+        /*continueAtBoundary=*/false);
+    CHECK(escaped == 0u);
+
+    // A ray resting on face 0 moving outward produces no cell segment
+    // (nextFaceIntersection finds no forward face), so the recovery path re-selects face 0
+    // as an exterior boundary. A continueTraversal boundary policy would otherwise spin
+    // forever; the guard must report a traversal failure instead.
+    hase::core::Point const boundaryOrigin{0.0, 1.0 / 3.0, 0.0};
+    REQUIRE(std::abs(hostView.getFaceBarycentricCoordinate(0u, 0u, boundaryOrigin)) <= 1.0e-12);
+    REQUIRE(hostView.getFaceBarycentricDirection(0u, 0u, direction) < 0.0);
+    auto const failed = hase::tests::walkRay(
+        device,
+        alpaka::getExecutor(backend),
+        mesh,
+        0u,
+        boundaryOrigin,
+        direction,
+        /*continueAtBoundary=*/true);
+    CHECK(failed == 1u);
 }

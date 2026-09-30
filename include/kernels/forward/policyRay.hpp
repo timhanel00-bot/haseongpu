@@ -467,16 +467,33 @@ namespace hase::kernels::forward::ray
         T_Ray& rayState,
         T_Behaviour behaviour)
     {
-        /* this while(true) is of course a bit optimistic - it means a ray terminates only when:
-            - the ray reaches a physical boundary,
-            - the cell policy terminates it
-            - an invalid geometric transition occurs.
-            @TODO determine whether there are other undetected cases that can cause a endless spinning loop -
-            !any hard limit would impose a restriction on the geometry in use or would require a cache state relaunch
-           behavior!
-         */
+        // A ray must make geometric progress: each accepted cell segment advances the
+        // position by a positive length. A transition that leaves the position unchanged
+        // therefore indicates non-progressing connectivity - for example a ray resting on
+        // an exterior face whose boundary policy keeps requesting continueTraversal. After a
+        // bounded number of consecutive position-preserving iterations, the walk reports a
+        // traversal failure instead of spinning forever. This counts consecutive
+        // non-progressing iterations, not total crossings, so it does not terminate a valid
+        // ray as the mesh is refined.
+        constexpr unsigned maxNonProgressingIterations = 1024u;
+        unsigned nonProgressingIterations = 0u;
+        hase::core::Point previousPosition = rayState.position;
         while(true)
         {
+            bool const positionChanged = rayState.position.x != previousPosition.x
+                                         || rayState.position.y != previousPosition.y
+                                         || rayState.position.z != previousPosition.z;
+            if(positionChanged)
+            {
+                nonProgressingIterations = 0u;
+            }
+            else if(++nonProgressingIterations > maxNonProgressingIterations)
+            {
+                behaviour.onFailure(acc, mesh, rayState);
+                return;
+            }
+            previousPosition = rayState.position;
+
             unsigned const currentCell = rayState.cell;
             assert(currentCell < mesh.numberOfCells);
             auto const intersection = nextFaceIntersection(
